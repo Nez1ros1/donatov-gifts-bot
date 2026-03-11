@@ -1,32 +1,51 @@
 import asyncio
 import logging
 import os
+import time
 import uuid
 from typing import Dict
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    FSInputFile,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
-load_dotenv()
+# Загружаем переменные окружения из .env файла
+load_dotenv()  # если файл называется иначе, укажите имя: load_dotenv('apppy.env')
 
-TOKEN = os.getenv("BOT_TOKEN", "8520179075:AAEgMESOlGJQeeAOY5kRsJrHuY-X5ZzJW38")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 5118322610))
-BOT_USERNAME = os.getenv("BOT_USERNAME", "Donatovgift_bot")
-MANAGER_USERNAME = "@Donatovgift_manager"
+# ⚠️ ВАЖНО: в файле .env должна быть строка: BOT_TOKEN=ваш_токен
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5118322610"))
+BOT_USERNAME = os.getenv("BOT_USERNAME", "DonatovGifts_bot")
+MANAGER_USERNAME = "@Donatovgift_manager"  # контакт менеджера
+
+# Путь к приветственной картинке (локальный файл)
+WELCOME_IMAGE_PATH = "/Users/vladislav/Desktop/Скам бот?/photo_2026-01-21_23-55-40.jpg"
 
 logging.basicConfig(level=logging.INFO)
+
+# Проверка наличия токена
+if not TOKEN:
+    raise ValueError(
+        "Токен бота не найден! Укажите BOT_TOKEN в файле .env"
+    )
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 
-# Состояния FSM
+# Состояния FSM для создания сделки
 class CreateDeal(StatesGroup):
     gift = State()
     currency = State()
@@ -35,28 +54,29 @@ class CreateDeal(StatesGroup):
 
 
 # Хранилища данных
-deals: Dict[str, dict] = {}
-admins: set[int] = {ADMIN_ID}
-user_successful_deals: Dict[int, int] = {}
-user_deals_count: Dict[int, int] = {}
-DEAL_TIMEOUT = 3600
+deals: Dict[str, dict] = {}                # активные сделки
+admins: set[int] = {ADMIN_ID}               # множество администраторов
+user_successful_deals: Dict[int, int] = {}  # успешные сделки пользователя
+user_deals_count: Dict[int, int] = {}       # общее количество созданных сделок
+DEAL_TIMEOUT = 3600  # время жизни сделки (1 час)
 
 
 def is_admin(user_id: int) -> bool:
+    """Проверка, является ли пользователь администратором"""
     return user_id in admins
 
 
 async def create_deal_id() -> str:
-    """Генерация уникального ID сделки"""
+    """Генерация уникального ID сделки (8 символов)"""
     for _ in range(50):
-        deal_id = str(uuid.uuid4())[:8].upper()
+        deal_id = uuid.uuid4().hex[:8].upper()
         if deal_id not in deals:
             return deal_id
-    raise ValueError("Не удалось создать уникальный ID")
+    raise RuntimeError("Не удалось создать уникальный ID после 50 попыток")
 
 
 async def send_log_to_admin(user_id: int, username: str, action: str, extra: str = ""):
-    """Отправка лога админу"""
+    """Отправка лога администратору"""
     try:
         await bot.send_message(
             ADMIN_ID,
@@ -68,86 +88,151 @@ async def send_log_to_admin(user_id: int, username: str, action: str, extra: str
 
 
 def get_main_menu(user_id: int) -> InlineKeyboardMarkup:
-    """Главное меню с статистикой"""
+    """Главное меню с кнопками и статистикой пользователя"""
     success = user_successful_deals.get(user_id, 0)
     total = user_deals_count.get(user_id, 0)
 
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text="💼 Создать сделку", callback_data="create_deal"))
     builder.add(InlineKeyboardButton(text=f"✅ {success}/{total}", callback_data="my_stats"))
-
     if is_admin(user_id):
-        builder.add(InlineKeyboardButton(text="👑 АДМИН", callback_data="admin_panel"))
-
-    builder.add(InlineKeyboardButton(text="💬 Поддержка", url="https://t.me/Donatovgift_manager"))
+        builder.add(InlineKeyboardButton(text="👑 АДМИН ПАНЕЛЬ", callback_data="admin_panel"))
+    builder.add(InlineKeyboardButton(text="💬 Поддержка", url=f"https://t.me/{MANAGER_USERNAME[1:]}"))
     builder.add(InlineKeyboardButton(text="⭐ Отзывы", url="https://t.me/Donatovgifts_review"))
-    builder.adjust(1, repeat=True)
+    builder.adjust(1)  # все кнопки в один столбец
     return builder.as_markup()
 
 
+# ----------------------------------------------------------------------
+# Обработчик команды /start с возможностью deep linking и картинкой
+# ----------------------------------------------------------------------
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    """Обработчик /start с deep linking"""
+    """Приветствие с картинкой и меню"""
     args = message.text.split(maxsplit=1)
 
+    # Если перешли по ссылке с параметром deal_XXXX
     if len(args) > 1 and args[1].startswith("deal_"):
         deal_id = args[1].replace("deal_", "")
         await show_payment_window(message, deal_id)
         return
 
-    await send_log_to_admin(message.from_user.id, message.from_user.username, "Старт бота")
-    await message.answer(
-        "🎁 <b>Donatovgift — безопасная торговля</b>",
-        reply_markup=get_main_menu(message.from_user.id),
-        parse_mode="HTML"
+    # Логируем запуск
+    await send_log_to_admin(
+        message.from_user.id,
+        message.from_user.username,
+        "Старт бота"
     )
 
+    # Текст приветствия
+    welcome_text = (
+        "🎁 <b>Donatovgift — безопасная торговля NFT</b>\n\n"
+        "Добро пожаловать! Здесь вы можете создавать сделки по продаже NFT-подарков "
+        "и безопасно получать оплату через гаранта.\n"
+        "• Мгновенное создание сделки\n"
+        "• Оплата напрямую через бота\n"
+        "• Поддержка 24/7\n\n"
+        "Нажмите кнопку ниже, чтобы начать 👇"
+    )
 
+    # Пытаемся отправить приветственную картинку
+    try:
+        if os.path.exists(WELCOME_IMAGE_PATH):
+            photo = FSInputFile(WELCOME_IMAGE_PATH)
+            await message.answer_photo(
+                photo=photo,
+                caption=welcome_text,
+                reply_markup=get_main_menu(message.from_user.id),
+                parse_mode="HTML"
+            )
+        else:
+            # Если файл не найден, отправляем только текст
+            await message.answer(
+                welcome_text,
+                reply_markup=get_main_menu(message.from_user.id),
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logging.error(f"Ошибка при отправке фото: {e}")
+        await message.answer(
+            welcome_text,
+            reply_markup=get_main_menu(message.from_user.id),
+            parse_mode="HTML"
+        )
+
+
+# ----------------------------------------------------------------------
+# Окно оплаты при переходе по ссылке на сделку
+# ----------------------------------------------------------------------
 async def show_payment_window(message: Message, deal_id: str):
-    """Окно оплаты при переходе по ссылке"""
+    """Отображает информацию о сделке и кнопку оплаты"""
     if deal_id not in deals:
-        await message.answer("❌ Сделка не найдена", reply_markup=get_main_menu(message.from_user.id))
+        await message.answer(
+            "❌ Сделка не найдена или уже завершена.",
+            reply_markup=get_main_menu(message.from_user.id)
+        )
         return
 
     deal = deals[deal_id]
     if deal.get('paid', False):
-        await message.answer("✅ Сделка выполнена", reply_markup=get_main_menu(message.from_user.id))
+        await message.answer(
+            "✅ Эта сделка уже оплачена и выполнена.",
+            reply_markup=get_main_menu(message.from_user.id)
+        )
         return
 
-    # Устанавливаем покупателя
+    # Запоминаем, кто сейчас просматривает сделку (потенциальный покупатель)
     deals[deal_id]['current_buyer'] = message.from_user.id
-    seller_success = user_successful_deals.get(deal['seller_id'], 0)
 
+    seller_success = user_successful_deals.get(deal['seller_id'], 0)
     symbol = "₽" if deal['currency'] == "Рубли" else "⭐"
 
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="💳 ОПЛАТИТЬ СЕЙЧАС", callback_data=f"pay_now_{deal_id}"))
-
+    builder.row(InlineKeyboardButton(
+        text="💳 ОПЛАТИТЬ СЕЙЧАС",
+        callback_data=f"pay_now_{deal_id}"
+    ))
     if is_admin(message.from_user.id):
-        builder.row(InlineKeyboardButton(text="🔥 НАКРУТИТЬ", callback_data=f"admin_pay_{deal_id}"))
+        builder.row(InlineKeyboardButton(
+            text="🔥 НАКРУТИТЬ (админ)",
+            callback_data=f"admin_pay_{deal_id}"
+        ))
+    builder.row(InlineKeyboardButton(
+        text="❌ Отмена",
+        callback_data="main_menu"
+    ))
 
-    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu"))
-
-    text = f"""💳 <b>ОПЛАТА СДЕЛКИ #{deal_id}</b>
-
-📦 <b>{deal['gift']}</b>
-💰 <b>{deal['price']} {symbol}</b>
-💳 <b>{deal['currency']}</b>
-✅ <b>Продавец: {seller_success} успехов</b>
-
-<i>🔥 Нажмите ОПЛАТИТЬ СЕЙЧАС</i>"""
+    text = (
+        f"💳 <b>ОПЛАТА СДЕЛКИ #{deal_id}</b>\n\n"
+        f"📦 <b>{deal['gift']}</b>\n"
+        f"💰 <b>{deal['price']} {symbol}</b>\n"
+        f"💳 <b>Способ оплаты: {deal['currency']}</b>\n"
+        f"✅ <b>Продавец выполнил {seller_success} успешных сделок</b>\n\n"
+        f"<i>Нажмите кнопку «ОПЛАТИТЬ СЕЙЧАС», чтобы подтвердить перевод.</i>"
+    )
 
     await message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
 
 
+# ----------------------------------------------------------------------
+# Обработка нажатия кнопки "Оплатить сейчас"
+# ----------------------------------------------------------------------
 @dp.callback_query(F.data.startswith("pay_now_"))
 async def instant_payment(callback: CallbackQuery):
-    """Мгновенная оплата кнопкой"""
+    """Мгновенная оплата от покупателя"""
     deal_id = callback.data.replace("pay_now_", "")
     await callback.answer("✅ Оплата принята!")
     await process_deal_payment(callback.from_user, deal_id)
+
+    # Инструкция для покупателя
+    text = (
+        f"✅ <b>Оплата зафиксирована!</b>\n\n"
+        f"📲 Для получения NFT свяжитесь с менеджером:\n"
+        f"{MANAGER_USERNAME}\n\n"
+        f"🔐 Укажите ID сделки: <code>{deal_id}</code>"
+    )
     await callback.message.edit_text(
-        "✅ <b>Оплата прошла!</b>\n⏳ Ожидайте NFT от продавца",
+        text,
         reply_markup=get_main_menu(callback.from_user.id),
         parse_mode="HTML"
     )
@@ -155,9 +240,9 @@ async def instant_payment(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("admin_pay_"))
 async def admin_fake_payment(callback: CallbackQuery):
-    """Админская накрутка оплаты"""
+    """Админская накрутка оплаты (для тестов)"""
     if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Нет доступа")
+        await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
     deal_id = callback.data.replace("admin_pay_", "")
@@ -166,54 +251,65 @@ async def admin_fake_payment(callback: CallbackQuery):
 
 
 async def process_deal_payment(user, deal_id: str):
-    """Обработка оплаты с уведомлением продавцу"""
+    """Общая логика обработки оплаты (уведомление продавца, обновление статистики)"""
     if deal_id not in deals or deals[deal_id].get('paid', False):
         return
 
     deal = deals[deal_id]
-    deals[deal_id]['paid'] = True
-    deals[deal_id]['buyer_id'] = user.id
-    deals[deal_id]['buyer_username'] = user.username
+    deal['paid'] = True
+    deal['buyer_id'] = user.id
+    deal['buyer_username'] = user.username
 
-    # +1 успех продавцу
+    # Увеличиваем счётчик успешных сделок продавца
     seller_id = deal['seller_id']
     user_successful_deals[seller_id] = user_successful_deals.get(seller_id, 0) + 1
 
     symbol = "₽" if deal['currency'] == "Рубли" else "⭐"
 
-    # 🔥 ТОЧНОЕ УВЕДОМЛЕНИЕ ПРОДАВЦУ
-    seller_text = f"""💰 <b>Пользователь переслал деньги!</b>
-
-Для успешной сделки, вам необходимо передать NFT менеджеру {MANAGER_USERNAME}
-<b>!Строго ему - критически важное правило!</b>
-
-━━━━━━━━━━━━━━━━━━━
-🆔 <b>Сделка #{deal_id}</b>
-🎁 <b>{deal['gift']}</b>
-💰 <b>{deal['price']} {symbol}</b>
-💳 <b>Реквизиты:</b> <code>{deal['requisites']}</code>
-
-✅ Теперь у вас <b>{user_successful_deals[seller_id]} успехов</b>"""
+    # Уведомление продавцу
+    seller_text = (
+        f"💰 <b>Пользователь переслал деньги!</b>\n\n"
+        f"Для завершения сделки передайте NFT менеджеру {MANAGER_USERNAME}\n"
+        f"<b>⚠️ Обязательно отправляйте NFT только менеджеру, иначе гарантия не работает!</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>Сделка #{deal_id}</b>\n"
+        f"🎁 <b>{deal['gift']}</b>\n"
+        f"💰 <b>{deal['price']} {symbol}</b>\n"
+        f"💳 <b>Реквизиты:</b> <code>{deal['requisites']}</code>\n\n"
+        f"✅ Теперь у вас <b>{user_successful_deals[seller_id]} успешных сделок</b>"
+    )
 
     await bot.send_message(seller_id, seller_text, parse_mode="HTML")
-    await send_log_to_admin(user.id, user.username, f"ОПЛАТА {deal_id}", deal['gift'])
+    await send_log_to_admin(
+        user.id,
+        user.username,
+        f"ОПЛАТА {deal_id}",
+        f"Подарок: {deal['gift']}"
+    )
 
 
-# FSM создание сделки
+# ----------------------------------------------------------------------
+# FSM: создание новой сделки
+# ----------------------------------------------------------------------
 @dp.callback_query(F.data == "create_deal")
 async def create_deal_start(callback: CallbackQuery, state: FSMContext):
     """Начало создания сделки"""
+    # Проверка лимита для обычных пользователей
     if not is_admin(callback.from_user.id):
         count = user_deals_count.get(callback.from_user.id, 0)
         if count >= 5:
-            await callback.answer("⏳ Лимит 5 сделок", show_alert=True)
+            await callback.answer(
+                "⏳ Вы достигли лимита в 5 активных сделок.",
+                show_alert=True
+            )
             return
 
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_deal"))
 
     await callback.message.edit_text(
-        "🎁 <b>Шаг 1/4 — Подарок</b>\n\n📦 Название подарка:",
+        "🎁 <b>Шаг 1/4 — Название подарка</b>\n\n"
+        "Введите название NFT-подарка (от 3 до 100 символов):",
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
@@ -225,27 +321,31 @@ async def create_deal_start(callback: CallbackQuery, state: FSMContext):
 async def cancel_deal(callback: CallbackQuery, state: FSMContext):
     """Отмена создания сделки"""
     await state.clear()
-    await callback.message.edit_text("❌ Создание отменено", reply_markup=get_main_menu(callback.from_user.id))
+    await callback.message.edit_text(
+        "❌ Создание сделки отменено.",
+        reply_markup=get_main_menu(callback.from_user.id)
+    )
     await callback.answer()
 
 
 @dp.message(CreateDeal.gift)
 async def process_gift(message: Message, state: FSMContext):
-    """Шаг 1 FSM"""
+    """Шаг 1: получение названия подарка"""
     gift = message.text.strip()
     if len(gift) < 3 or len(gift) > 100:
-        await message.answer("❌ 3-100 символов")
+        await message.answer("❌ Название должно содержать от 3 до 100 символов.")
         return
 
     await state.update_data(gift=gift)
 
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="₽ Рубли", callback_data="currency_rub"))
-    builder.row(InlineKeyboardButton(text="⭐ Звёзды", callback_data="currency_stars"))
+    builder.row(InlineKeyboardButton(text="⭐ Звёзды Telegram", callback_data="currency_stars"))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_deal"))
 
     await message.answer(
-        f"✅ <b>Подарок: {gift}</b>\n\n💰 Шаг 2/4 — валюта:",
+        f"✅ <b>Подарок:</b> {gift}\n\n"
+        f"💰 <b>Шаг 2/4 — Выберите валюту:</b>",
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
@@ -254,7 +354,7 @@ async def process_gift(message: Message, state: FSMContext):
 
 @dp.callback_query(CreateDeal.currency, F.data.startswith("currency_"))
 async def process_currency(callback: CallbackQuery, state: FSMContext):
-    """Шаг 2 FSM"""
+    """Шаг 2: выбор валюты"""
     currency = "Рубли" if callback.data == "currency_rub" else "Звёзды Telegram"
     await state.update_data(currency=currency)
 
@@ -262,7 +362,9 @@ async def process_currency(callback: CallbackQuery, state: FSMContext):
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_deal"))
 
     await callback.message.edit_text(
-        f"✅ <b>{currency}</b>\n\n💵 Шаг 3/4 — цена (1-100000):",
+        f"✅ <b>Валюта:</b> {currency}\n\n"
+        f"💵 <b>Шаг 3/4 — Укажите цену</b>\n"
+        f"(целое число от 1 до 100 000):",
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
@@ -272,21 +374,27 @@ async def process_currency(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(CreateDeal.price)
 async def process_price(message: Message, state: FSMContext):
-    """Шаг 3 FSM"""
+    """Шаг 3: ввод цены"""
     price = message.text.strip().replace(" ", "")
-    if not price.isdigit() or not (1 <= int(price) <= 100000):
-        await message.answer("❌ Цена 1-100000")
+    if not price.isdigit():
+        await message.answer("❌ Цена должна быть числом.")
+        return
+    price_int = int(price)
+    if not (1 <= price_int <= 100000):
+        await message.answer("❌ Цена должна быть от 1 до 100 000.")
         return
 
     await state.update_data(price=price)
+
     data = await state.get_data()
-    req_type = "карта" if data['currency'] == "Рубли" else "@username"
+    req_type = "номер карты" if data['currency'] == "Рубли" else "username получателя звёзд"
 
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_deal"))
 
     await message.answer(
-        f"✅ <b>{price}</b>\n\n💳 Шаг 4/4 — {req_type}:",
+        f"✅ <b>Цена:</b> {price} {'₽' if data['currency'] == 'Рубли' else '⭐'}\n\n"
+        f"💳 <b>Шаг 4/4 — Введите {req_type}</b>:",
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
@@ -295,10 +403,16 @@ async def process_price(message: Message, state: FSMContext):
 
 @dp.message(CreateDeal.requisites)
 async def process_requisites(message: Message, state: FSMContext):
-    """Завершение создания сделки"""
-    await state.update_data(requisites=message.text.strip())
+    """Шаг 4: реквизиты и завершение создания сделки"""
+    requisites = message.text.strip()
+    if not requisites:
+        await message.answer("❌ Реквизиты не могут быть пустыми.")
+        return
+
+    await state.update_data(requisites=requisites)
     data = await state.get_data()
 
+    # Генерируем уникальный ID сделки
     deal_id = await create_deal_id()
     deals[deal_id] = {
         'seller_id': message.from_user.id,
@@ -309,89 +423,218 @@ async def process_requisites(message: Message, state: FSMContext):
         'requisites': data['requisites'],
         'paid': False,
         'current_buyer': None,
-        'created_at': asyncio.get_event_loop().time()
+        'created_at': time.time()  # время создания
     }
 
+    # Увеличиваем счётчик созданных сделок (кроме админов)
     if not is_admin(message.from_user.id):
         user_deals_count[message.from_user.id] = user_deals_count.get(message.from_user.id, 0) + 1
 
-    # 🔥 КНОПКА ПЕРЕСЫЛКИ
-    share_text = f"Сделка #{deal_id}\n{data['gift']} за {data['price']} {'₽' if data['currency'] == 'Рубли' else '⭐'}\n🔗 https://t.me/{BOT_USERNAME}?start=deal_{deal_id}"
+    # Формируем ссылку на сделку
+    share_text = (
+        f"Сделка #{deal_id}\n"
+        f"{data['gift']} за {data['price']} "
+        f"{'₽' if data['currency'] == 'Рубли' else '⭐'}\n"
+        f"🔗 https://t.me/{BOT_USERNAME}?start=deal_{deal_id}"
+    )
 
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="📤 ПЕРЕСЛАТЬ ПОКУПАТЕЛЮ", switch_inline_query=share_text))
-    builder.row(InlineKeyboardButton(text="🏠 В меню", callback_data="main_menu"))
+    builder.row(InlineKeyboardButton(
+        text="📤 ПЕРЕСЛАТЬ ПОКУПАТЕЛЮ",
+        switch_inline_query=share_text
+    ))
+    builder.row(InlineKeyboardButton(
+        text="🏠 В главное меню",
+        callback_data="main_menu"
+    ))
 
     symbol = "₽" if data['currency'] == "Рубли" else "⭐"
-    text = f"""✅ <b>Сделка создана #{deal_id}</b>
-
-🎁 {data['gift']}
-💰 {data['price']} {symbol}
-
-📤 <b>ПЕРЕСЛАТЬ:</b> Нажмите кнопку выше!"""
+    text = (
+        f"✅ <b>Сделка успешно создана!</b>\n\n"
+        f"🆔 <b>#{deal_id}</b>\n"
+        f"🎁 {data['gift']}\n"
+        f"💰 {data['price']} {symbol}\n\n"
+        f"📤 Нажмите кнопку ниже, чтобы отправить ссылку покупателю."
+    )
 
     await message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
-    await send_log_to_admin(message.from_user.id, message.from_user.username, f"СОЗДАНА {deal_id}")
+    await send_log_to_admin(
+        message.from_user.id,
+        message.from_user.username,
+        f"СОЗДАНА {deal_id}",
+        data['gift']
+    )
     await state.clear()
 
 
-# Остальные обработчики
+# ----------------------------------------------------------------------
+# Прочие обработчики (главное меню, статистика, админ-команды)
+# ----------------------------------------------------------------------
 @dp.callback_query(F.data == "main_menu")
 async def main_menu_handler(callback: CallbackQuery):
-    await callback.message.edit_text("🏠 Главное меню", reply_markup=get_main_menu(callback.from_user.id))
+    """Возврат в главное меню"""
+    await callback.message.edit_text(
+        "🏠 Главное меню",
+        reply_markup=get_main_menu(callback.from_user.id)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "my_stats")
+async def my_stats_handler(callback: CallbackQuery):
+    """Показывает статистику пользователя"""
+    success = user_successful_deals.get(callback.from_user.id, 0)
+    total = user_deals_count.get(callback.from_user.id, 0)
+    await callback.answer(
+        f"📊 Успешных сделок: {success}\n📦 Всего создано: {total}",
+        show_alert=True
+    )
+
+
+@dp.callback_query(F.data == "admin_panel")
+async def admin_panel_handler(callback: CallbackQuery):
+    """Админ-панель (заглушка)"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Доступ запрещён", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "👑 <b>Админ-панель</b>\n\n"
+        "Доступные команды:\n"
+        "• <code>/deals</code> — список активных сделок\n"
+        "• <code>/fake_pay ID</code> — пометить сделку как оплаченную\n"
+        "• <code>/setdeals число</code> — установить количество созданных сделок\n"
+        "• <code>/set_success число</code> — установить количество успехов\n\n"
+        "Также в окне оплаты сделки для админа появляется кнопка «НАКРУТИТЬ».",
+        reply_markup=get_main_menu(callback.from_user.id),
+        parse_mode="HTML"
+    )
     await callback.answer()
 
 
 @dp.message(Command("setdeals"))
 async def set_deals(message: Message):
+    """Админская команда: установить количество созданных сделок"""
     if not is_admin(message.from_user.id):
         return
     args = message.text.split()
     if len(args) < 2:
-        return await message.answer("❌ /setdeals 90")
+        await message.answer("❌ Использование: /setdeals <число>")
+        return
     try:
         count = int(args[1])
         user_deals_count[message.from_user.id] = count
-        await message.answer(f"✅ Сделок: {count}")
+        await message.answer(f"✅ Количество сделок установлено: {count}")
     except ValueError:
-        await message.answer("❌ Число!")
+        await message.answer("❌ Введите целое число.")
 
 
 @dp.message(Command("set_success"))
 async def set_success(message: Message):
+    """Админская команда: установить количество успешных сделок"""
     if not is_admin(message.from_user.id):
         return
     args = message.text.split()
     if len(args) < 2:
-        return await message.answer("❌ /set_success 90")
+        await message.answer("❌ Использование: /set_success <число>")
+        return
     try:
         count = int(args[1])
         user_successful_deals[message.from_user.id] = count
-        await message.answer(f"✅ Успехов: {count}")
+        await message.answer(f"✅ Количество успехов установлено: {count}")
     except ValueError:
-        await message.answer("❌ Число!")
+        await message.answer("❌ Введите целое число.")
 
 
 @dp.message(Command("stats"))
 async def show_stats(message: Message):
+    """Показывает статистику пользователя"""
     success = user_successful_deals.get(message.from_user.id, 0)
     total = user_deals_count.get(message.from_user.id, 0)
-    await message.answer(f"📊 Успехов: {success}\n📦 Сделок: {total}")
+    await message.answer(
+        f"📊 <b>Ваша статистика</b>\n\n"
+        f"✅ Успешных сделок: {success}\n"
+        f"📦 Всего создано сделок: {total}",
+        parse_mode="HTML"
+    )
 
 
+# ==================== НОВЫЕ АДМИНСКИЕ КОМАНДЫ ====================
+
+@dp.message(Command("deals"))
+async def list_deals(message: Message):
+    """Админская команда: /deals — показать все активные сделки"""
+    if not is_admin(message.from_user.id):
+        return
+    if not deals:
+        await message.answer("📭 Нет активных сделок.")
+        return
+    lines = []
+    for deal_id, deal in deals.items():
+        if deal.get('paid', False):
+            status = "✅ оплачена"
+        else:
+            status = "⏳ ожидает"
+        symbol = "₽" if deal['currency'] == "Рубли" else "⭐"
+        created = time.strftime('%d.%m %H:%M', time.localtime(deal.get('created_at', 0)))
+        lines.append(
+            f"<code>{deal_id}</code> | {deal['gift'][:20]} | {deal['price']}{symbol} | {status} | {created}"
+        )
+    text = "📋 <b>Активные сделки:</b>\n" + "\n".join(lines)
+    # Разбиваем на части, если слишком длинное сообщение
+    if len(text) > 4000:
+        for x in range(0, len(text), 4000):
+            await message.answer(text[x:x+4000], parse_mode="HTML")
+    else:
+        await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("fake_pay"))
+async def fake_pay_command(message: Message):
+    """Админская команда: /fake_pay ID_сделки — пометить сделку как оплаченную"""
+    if not is_admin(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Использование: /fake_pay <ID_сделки>")
+        return
+    deal_id = args[1].upper()
+    if deal_id not in deals:
+        await message.answer("❌ Сделка с таким ID не найдена.")
+        return
+    if deals[deal_id].get('paid', False):
+        await message.answer("❌ Эта сделка уже оплачена.")
+        return
+    # Вызываем process_deal_payment от имени администратора
+    await process_deal_payment(message.from_user, deal_id)
+    await message.answer(f"✅ Сделка {deal_id} помечена как оплаченная.")
+
+
+# ----------------------------------------------------------------------
+# Фоновая задача для удаления просроченных сделок
+# ----------------------------------------------------------------------
 async def cleanup_loop():
-    """Очистка просроченных сделок"""
+    """Каждые 5 минут удаляет сделки старше DEAL_TIMEOUT"""
     while True:
-        await asyncio.sleep(300)
-        current_time = asyncio.get_event_loop().time()
-        expired = [did for did, deal in list(deals.items()) if current_time - deal.get('created_at', 0) > DEAL_TIMEOUT]
-        for did in expired:
-            del deals[did]
+        await asyncio.sleep(300)  # 5 минут
+        current_time = time.time()
+        expired = [
+            deal_id
+            for deal_id, deal in list(deals.items())
+            if current_time - deal.get('created_at', 0) > DEAL_TIMEOUT
+        ]
+        for deal_id in expired:
+            del deals[deal_id]
+        if expired:
+            logging.info(f"Удалено просроченных сделок: {len(expired)}")
 
 
+# ----------------------------------------------------------------------
+# Запуск бота
+# ----------------------------------------------------------------------
 async def main():
+    # Создаём фоновую задачу для очистки
     asyncio.create_task(cleanup_loop())
-    print("🤖 Бот запущен!")
+    logging.info("Бот запущен!")
     await dp.start_polling(bot)
 
 
